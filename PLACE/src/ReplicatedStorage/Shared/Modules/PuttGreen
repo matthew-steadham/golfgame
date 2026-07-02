@@ -1,0 +1,367 @@
+--!strict
+-- PuttGreen
+-- On-green putting aids, drawn with pooled adornments in their OWN folder. Nothing here touches
+-- the shot tracer (TracerController) -- putts are deliberately tracer-free.
+--
+--   PuttGreen.showPreview(points)  -- a line through world points (e.g. the breaking putt path).
+--   PuttGreen.showGrid(centerXZ, terrainFn, cupCenter?)
+--                                  -- a square grid draped over the green:
+--                                       * a static lattice COLOURED by slope (level -> steep)
+--                                       * animated COMET highlights flowing DOWNHILL along each
+--                                         gridline (bright head, fading tail), faster where steeper.
+--                                     Each gridline is tessellated (GRID.fidelity sub-segments per
+--                                     square) so the lines CONTOUR to the green instead of chording
+--                                     flat across it. The square size is GRID.spacing, separately.
+--
+-- Spacing / fidelity / extent / visibility, slope colours and the comet flow are runtime-tunable
+-- (PuttGreen.set* and getGrid/getFlow) so the skills you add later can make the read easier.
+
+local RunService = game:GetService("RunService")
+
+export type Sample = { height: number, normal: Vector3, surface: number }
+
+local PuttGreen = {}
+
+local GREEN_SURFACE = 4 -- GroundResolver surface id for the green
+
+------------------------------------------------------------------- folder + pools
+local folder: Folder? = nil
+local function ensureFolder(): Folder
+	if not folder or not folder:IsDescendantOf(workspace) then
+		local existing = workspace:FindFirstChild("PuttGreenAdorn")
+		if existing and existing:IsA("Folder") then
+			folder = existing
+		else
+			local f = Instance.new("Folder")
+			f.Name = "PuttGreenAdorn"
+			f.Parent = workspace
+			folder = f
+		end
+	end
+	return folder :: Folder
+end
+
+local function newLine(parent: Folder): LineHandleAdornment
+	local l = Instance.new("LineHandleAdornment")
+	l.AlwaysOnTop = true
+	l.Adornee = workspace.Terrain -- identity CFrame -> adornment CFrames are world space
+	l.Visible = false
+	l.Parent = parent
+	return l
+end
+
+local previewPool: { LineHandleAdornment } = {}
+local basePool: { LineHandleAdornment } = {}   -- static slope-coloured lattice
+local flowPool: { LineHandleAdornment } = {}   -- comet sub-segments
+
+local function hidePool(pool: { LineHandleAdornment })
+	for _, l in pool do
+		l.Visible = false
+	end
+end
+
+------------------------------------------------------------------- tunables
+local PREVIEW = {
+	color = Color3.fromRGB(245, 245, 245), -- near-white: clearly NOT the blue shot tracer
+	thickness = 15,
+}
+
+local GRID = {
+	spacing = 6.0,    -- studs between grid lines (the square size)  <-- skills may adjust
+	fidelity = 15,     -- sub-segments PER square edge, so lines contour the green (1 = flat chord)
+	extent = 100.0,    -- studs: half-width of the grid square around the centre
+	lift = 0.05,      -- studs above the surface (avoid z-fighting)
+	thickness = 5,
+	transparency = 0.30,
+	flatColor = Color3.fromRGB(70, 180, 75),   -- level ground (green)
+	midColor = Color3.fromRGB(235, 205, 55),   -- mid slope (yellow): keeps the green->red ramp vivid
+	steepColor = Color3.fromRGB(215, 45, 40),  -- hard slope (red)
+	steepAt = 0.12,   -- fall-line sin (~6.9 deg) at which colour reaches full red
+	visible = true,   -- master toggle (skills/gating can flip this)
+}
+
+local FLOW = {
+	color = Color3.fromRGB(255, 255, 255), -- bright comet head colour
+	thickness = 7,
+	dashLen = 1,        -- studs: total comet length (head -> tail)
+	tailSegments = 10,     -- sub-segments per comet (more = smoother fade; costs adornments)
+	perEdge = 1,          -- comets per gridline edge (more = denser flow)
+	speedScale = 22.0,    -- studs/sec per unit along-edge fall (steeper -> faster)
+	minSpeed = 0.6,       -- studs/sec floor so gentle slopes still drift (set 0 to freeze flats)
+	minFall = 0.012,      -- along-edge fall below this gets no comet (treated as flat)
+}
+
+function PuttGreen.setGridSpacing(studs: number)
+	GRID.spacing = math.max(1, studs)
+end
+function PuttGreen.setGridFidelity(subSegments: number)
+	GRID.fidelity = math.max(1, math.floor(subSegments))
+end
+function PuttGreen.setGridExtent(studs: number)
+	GRID.extent = math.max(GRID.spacing, studs)
+end
+function PuttGreen.setGridVisible(on: boolean)
+	GRID.visible = on
+end
+function PuttGreen.setFlowSpeed(scale: number)
+	FLOW.speedScale = math.max(0, scale)
+end
+function PuttGreen.getGrid()
+	return GRID -- expose so a skill can tweak colours/transparency/fidelity directly
+end
+function PuttGreen.getFlow()
+	return FLOW
+end
+
+------------------------------------------------------------------- preview line
+local function drawSeg(pool: { LineHandleAdornment }, idx: number, parent: Folder, a: Vector3, b: Vector3, color: Color3, thick: number, transp: number): number
+	local len = (b - a).Magnitude
+	if len < 1e-4 then
+		return idx
+	end
+	local l = pool[idx]
+	if not l then
+		l = newLine(parent)
+		pool[idx] = l
+	end
+	l.CFrame = CFrame.lookAt(a, b)
+	l.Length = len
+	l.Thickness = thick
+	l.Color3 = color
+	l.Transparency = transp
+	l.Visible = true
+	return idx + 1
+end
+
+function PuttGreen.hidePreview()
+	hidePool(previewPool)
+end
+
+function PuttGreen.showPreview(points: { Vector3 })
+	if #points < 2 then
+		PuttGreen.hidePreview()
+		return
+	end
+	local parent = ensureFolder()
+	local idx = 1
+	for i = 1, #points - 1 do
+		idx = drawSeg(previewPool, idx, parent, points[i], points[i + 1], PREVIEW.color, PREVIEW.thickness, 0)
+	end
+	for j = idx, #previewPool do
+		previewPool[j].Visible = false
+	end
+end
+
+------------------------------------------------------------------- break grid (contoured + comet)
+-- a lane is the DOWNHILL-oriented, contoured polyline of one gridline edge (fidelity+1 points)
+type Lane = { points: { Vector3 }, F: number, len: number, speed: number, p: number, di: number }
+local lanes: { Lane } = {}
+local animConn: RBXScriptConnection? = nil
+
+local function stopAnim()
+	if animConn then
+		animConn:Disconnect()
+		animConn = nil
+	end
+end
+
+-- point at fraction g (0..1) along a contoured polyline of F segments (points[1..F+1])
+local function polyPoint(points: { Vector3 }, F: number, g: number): Vector3
+	if g <= 0 then
+		return points[1]
+	elseif g >= 1 then
+		return points[F + 1]
+	end
+	local x = g * F
+	local seg = math.floor(x)
+	if seg >= F then
+		seg = F - 1
+	end
+	return points[seg + 1]:Lerp(points[seg + 2], x - seg)
+end
+
+-- fixed transparency ramp for the comet: 0 (head) -> ~0.95 (tail)
+local function tailAlpha(k: number, K: number): number
+	if K <= 1 then
+		return 0
+	end
+	return math.clamp(0.92 * (k / (K - 1)), 0, 0.95)
+end
+
+local function animStep(dt: number)
+	local K = FLOW.tailSegments
+	local segLen = FLOW.dashLen / K
+	for _, lane in lanes do
+		lane.p = (lane.p + lane.speed * dt / lane.len) % 1
+		local segFrac = segLen / lane.len
+		local pts, F = lane.points, lane.F
+		for j = 1, FLOW.perEdge do
+			local headG = (lane.p + (j - 1) / FLOW.perEdge) % 1
+			local base = lane.di + (j - 1) * K
+			for k = 0, K - 1 do
+				local d = flowPool[base + k]
+				if d then
+					local gH = headG - k * segFrac
+					if gH > 0 then
+						local pH = polyPoint(pts, F, gH)
+						local pT = polyPoint(pts, F, gH - segFrac)
+						d.CFrame = CFrame.lookAt(pT, pH)
+						d.Length = (pH - pT).Magnitude
+						d.Visible = true
+					else
+						d.Visible = false
+					end
+				end
+			end
+		end
+	end
+end
+
+function PuttGreen.hideGrid()
+	stopAnim()
+	table.clear(lanes)
+	hidePool(basePool)
+	hidePool(flowPool)
+end
+
+-- centerXZ = (x, z) the grid centres on (typically the ball). terrainFn(x, z) -> Sample.
+function PuttGreen.showGrid(centerXZ: Vector2, terrainFn: (number, number) -> Sample, cupCenter: Vector3?)
+	if not GRID.visible then
+		PuttGreen.hideGrid()
+		return
+	end
+	local parent = ensureFolder()
+	local spacing = GRID.spacing
+	local F = math.max(1, GRID.fidelity)
+	local K = FLOW.tailSegments
+	local steps = math.max(1, math.floor(GRID.extent / spacing))
+	local cx = math.floor(centerXZ.X / spacing + 0.5) * spacing
+	local cz = math.floor(centerXZ.Y / spacing + 0.5) * spacing
+	local n = 2 * steps + 1
+
+	-- node lattice: X/Z coords, on-green test, and downhill (fall) vector for lane orientation
+	local nodeX, nodeZ = {}, {}
+	for ix = 1, n do
+		nodeX[ix] = cx + (ix - 1 - steps) * spacing
+	end
+	for iz = 1, n do
+		nodeZ[iz] = cz + (iz - 1 - steps) * spacing
+	end
+	local onGreen: { { boolean } } = {}
+	local nodeFall: { { Vector3 } } = {}
+	for ix = 1, n do
+		onGreen[ix], nodeFall[ix] = {}, {}
+		for iz = 1, n do
+			local s = terrainFn(nodeX[ix], nodeZ[iz])
+			onGreen[ix][iz] = (s.surface == GREEN_SURFACE)
+			nodeFall[ix][iz] = Vector3.new(s.normal.X, 0, s.normal.Z)
+		end
+	end
+
+	local function colorFor(a: number, b: number): Color3
+		-- green -> yellow -> red across 0..steepAt (yellow midpoint keeps the ramp vivid)
+		local t = math.clamp(((a + b) * 0.5) / GRID.steepAt, 0, 1)
+		if t < 0.5 then
+			return GRID.flatColor:Lerp(GRID.midColor, t * 2)
+		else
+			return GRID.midColor:Lerp(GRID.steepColor, (t - 0.5) * 2)
+		end
+	end
+
+	table.clear(lanes)
+	local baseIdx = 1
+	local dashSlots = 0
+
+	-- tessellate one edge into F sub-segments that follow the surface; colour each by local slope,
+	-- and register a downhill-oriented comet lane along the same contoured polyline.
+	local function addEdge(ax: number, az: number, bx: number, bz: number, fA: Vector3, fB: Vector3)
+		local pts = table.create(F + 1)
+		local steep = table.create(F + 1)
+		for k = 0, F do
+			local t = k / F
+			local x, z = ax + (bx - ax) * t, az + (bz - az) * t
+			local s = terrainFn(x, z)
+			pts[k + 1] = Vector3.new(x, s.height + GRID.lift, z)
+			steep[k + 1] = Vector3.new(s.normal.X, 0, s.normal.Z).Magnitude
+		end
+		for k = 1, F do
+			baseIdx = drawSeg(basePool, baseIdx, parent, pts[k], pts[k + 1], colorFor(steep[k], steep[k + 1]), GRID.thickness, GRID.transparency)
+		end
+
+		local horiz = Vector3.new(bx - ax, 0, bz - az)
+		local hm = horiz.Magnitude
+		if hm < 1e-4 then
+			return
+		end
+		local comp = ((fA + fB) * 0.5):Dot(horiz / hm) -- + means downhill points a->b
+		local lanePts = pts
+		if comp < 0 then
+			comp = -comp
+			lanePts = table.create(F + 1)
+			for k = 1, F + 1 do
+				lanePts[k] = pts[F + 2 - k] -- reverse so the comet flows downhill
+			end
+		end
+		if comp < FLOW.minFall then
+			return -- flat along this edge: no comet
+		end
+		lanes[#lanes + 1] = {
+			points = lanePts,
+			F = F,
+			len = hm,
+			speed = math.max(FLOW.minSpeed, comp * FLOW.speedScale),
+			p = math.random(),
+			di = dashSlots + 1,
+		}
+		dashSlots += FLOW.perEdge * K
+	end
+
+	for ix = 1, n do
+		for iz = 1, n do
+			if onGreen[ix][iz] then
+				if ix < n and onGreen[ix + 1][iz] then
+					addEdge(nodeX[ix], nodeZ[iz], nodeX[ix + 1], nodeZ[iz], nodeFall[ix][iz], nodeFall[ix + 1][iz])
+				end
+				if iz < n and onGreen[ix][iz + 1] then
+					addEdge(nodeX[ix], nodeZ[iz], nodeX[ix], nodeZ[iz + 1], nodeFall[ix][iz], nodeFall[ix][iz + 1])
+				end
+			end
+		end
+	end
+
+	for j = baseIdx, #basePool do
+		basePool[j].Visible = false
+	end
+
+	-- comet sub-segments: slot's position-in-trail k = (i-1) % K (every lane block starts on a
+	-- multiple of K), so the fade is styled ONCE here and animStep only moves them.
+	while #flowPool < dashSlots do
+		table.insert(flowPool, newLine(parent))
+	end
+	for i = 1, #flowPool do
+		local d = flowPool[i]
+		if i <= dashSlots then
+			d.Thickness = FLOW.thickness
+			d.Color3 = FLOW.color
+			d.Transparency = tailAlpha((i - 1) % K, K)
+		else
+			d.Visible = false
+		end
+	end
+
+	if dashSlots > 0 then
+		if not animConn then
+			animConn = RunService.Heartbeat:Connect(animStep)
+		end
+		animStep(0)
+	else
+		stopAnim()
+	end
+end
+
+function PuttGreen.hideAll()
+	PuttGreen.hidePreview()
+	PuttGreen.hideGrid()
+end
+
+return PuttGreen
