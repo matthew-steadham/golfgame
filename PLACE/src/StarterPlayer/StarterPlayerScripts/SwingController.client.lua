@@ -21,6 +21,7 @@ local Clubs = require(Mods.Clubs)
 local SwingConfig = require(Mods.SwingConfig)
 local CourseData = require(Mods.CourseData)
 local Tracers = require(Mods.TracerController)
+local PuttGreen = require(Mods.PuttGreen)
 
 -- ===== tunables =====
 -- ===== course data =====
@@ -36,6 +37,7 @@ local CAM_BACK = 6
 local CAM_HEIGHT = 4
 local CAM_LOOKAHEAD = 60
 local PLAYBACK_SPEED = 1
+local PLAYBACK_FFWD = 2 -- hold Space during a shot to fast-forward playback at this multiple
 local FOLLOW_BACK = 22
 local FOLLOW_HEIGHT = 8
 local AIM_SMOOTH = 12
@@ -129,7 +131,12 @@ buildPin(cupCenter)
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
 camera.CameraType = Enum.CameraType.Scriptable
-UserInputService.MouseIconEnabled = false
+
+local CURSOR_ICON = "rbxassetid://140009585333357" -- e.g. "rbxassetid://1234567890"
+UserInputService.MouseIconEnabled = true
+if CURSOR_ICON ~= "" then
+	UserInputService.MouseIcon = CURSOR_ICON
+end
 
 local function lockCharacter(char: Model)
 	local hum = char:WaitForChild("Humanoid") :: Humanoid
@@ -284,6 +291,7 @@ local function startHole(n: number): boolean
 	forceSnapNextFrame = true
 	lastPreviewSig = nil
 	clearAdornments()
+	PuttGreen.hideAll()
 	camera.CFrame = addressTarget()
 	return true
 end
@@ -352,6 +360,16 @@ local PUTT_REST = GroundResolver.REST_SPEED          -- studs/s the ball rests b
 
 local function isPutt(): boolean
 	return currentClub.name == "Putter"
+end
+
+-- Show the break grid when the player is on the green with the putter; hide it otherwise.
+-- (The grid depends only on terrain, so it is refreshed on rest/club-change, not every frame.)
+local function refreshGreenGrid()
+	if isPutt() and terrain(ball.Position.X, ball.Position.Z).surface == 4 then
+		PuttGreen.showGrid(Vector2.new(ball.Position.X, ball.Position.Z), terrain, cupCenter)
+	else
+		PuttGreen.hideGrid()
+	end
 end
 
 -- launch speed (studs/s) that rolls `distStuds` on flat green: inverse of the roll integrator
@@ -467,16 +485,22 @@ local function updateAimAndInput(dt: number)
 	if sig ~= lastPreviewSig then
 		lastPreviewSig = sig
 		if isPutt() then
-			local ft = puttReachFt(distanceFraction)
-			local rp = ball.Position + aimDirection() * (ft * STUDS_PER_FT)
-			rp = Vector3.new(rp.X, terrain(rp.X, rp.Z).height + 0.05, rp.Z)
-			if Difficulty.get().preShotPath then
-				updateLivePreviewTracer({ ball.Position, rp })
-				local val, unit = ft, "FT"
-				if ft < 1 then val, unit = ft * 12, "IN" end
+			clearAdornments() -- putts never use the shot tracer
+			local onGreen = terrain(ball.Position.X, ball.Position.Z).surface == 4
+			if Difficulty.get().preShotPath and onGreen then
+				-- Normal aiming, like any other club: a straight aim line to the flat reach at the
+				-- current dial. Read the break off the grid, or press the preview key (V) to watch
+				-- the real putt roll out.
+				local ft = puttReachFt(distanceFraction)
+				local rp = ball.Position + aimDirection() * (ft * STUDS_PER_FT)
+				rp = Vector3.new(rp.X, terrain(rp.X, rp.Z).height + 0.06, rp.Z)
+				PuttGreen.showPreview({ ball.Position + Vector3.new(0, 0.06, 0), rp })
+				local ft2 = ft
+				local val, unit = ft2, "FT"
+				if ft2 < 1 then val, unit = ft2 * 12, "IN" end
 				showDistanceMarker(rp, val, unit)
 			else
-				clearAdornments()
+				PuttGreen.hidePreview()
 				hideDistanceMarker()
 			end
 			return
@@ -536,6 +560,7 @@ local function playback(path: Ballistics.Path)
 	busy = true
 	RunService:UnbindFromRenderStep("GolfCameraAim")
 	clearAdornments()
+	PuttGreen.hideAll() -- drop the preview line + break grid while the ball is moving
 
 	local apexIndex, apexY = 1, -math.huge
 	for idx, smp in path do
@@ -557,7 +582,8 @@ local function playback(path: Ballistics.Path)
 	local clock, i = 0, 1
 
 	local function updatePlaybackLoop(frameDt: number)
-		clock += frameDt * PLAYBACK_SPEED
+		local ff = if UserInputService:IsKeyDown(Enum.KeyCode.Space) then PLAYBACK_FFWD else 1
+		clock += frameDt * PLAYBACK_SPEED * ff
 		while i < #path and path[i + 1].t <= clock do
 			i += 1
 		end
@@ -580,7 +606,7 @@ local function playback(path: Ballistics.Path)
 			-- ASCENT VIEW
 			lookTarget = lookTarget:Lerp(ballNow, 1 - math.exp(-TRACK_SMOOTH * frameDt))
 			camera.CFrame = CFrame.lookAt(fixedCamPos, lookTarget)
-			updateProgressiveTracer(path, i)
+			if not isPutt() then updateProgressiveTracer(path, i) end
 		else
 			-- DESCENT VIEW (Fly/Chase view cuts in)
 			if not descending then
@@ -644,6 +670,7 @@ local function playback(path: Ballistics.Path)
 				busy = false
 				postShotTransition() -- shot is done: dissolve HUD, then curtain-cut to next shot
 				RunService:BindToRenderStep("GolfCameraAim", Enum.RenderPriority.Camera.Value, updateAimAndInput)
+				refreshGreenGrid() -- ball at rest: show the break grid if we are putting on the green
 			end)
 		end
 	end
@@ -683,6 +710,7 @@ capture.onCompleted = function(swing)
 	strokes += 1
 	hideDistanceMarker()
 	swinging = false
+	PuttGreen.hideAll() -- putt struck: clear the break grid + aim line immediately
 
 	-- Forgive FIRST: the cards/colours reflect the FORGIVEN swing -- exactly what the ball does.
 	-- On Legend (zero forgiveness) the card equals your raw swing 1:1; easier tiers iron out the error, so the card shows the smaller, assisted miss the ball actually flies.
@@ -754,9 +782,84 @@ end
 capture.onCancelled = function() setPowerRing(0) resetSwingFeedback() swinging = false end
 capture:Arm()
 
+-- Putt preview: roll the ball exactly as a perfectly-struck putt at the current dial + aim would
+-- travel (the real breaking path), then snap back to address. Costs no stroke, draws no tracer.
+local puttPreviewing = false
+local function previewPuttRoll()
+	if busy or puttPreviewing then
+		return
+	end
+	if not isPutt() or terrain(ball.Position.X, ball.Position.Z).surface ~= 4 then
+		return
+	end
+
+	local v0 = distanceFraction * PUTT_V_MAX
+	local landing = { position = ball.Position, velocity = aimDirection() * v0, spin = Vector3.zero, time = 0 }
+	local path = GroundResolver.resolve(landing, terrain, { cup = { center = cupCenter } })
+	if #path < 2 then
+		return
+	end
+
+	puttPreviewing = true
+	busy = true
+	RunService:UnbindFromRenderStep("GolfCameraAim")
+	clearAdornments()
+	PuttGreen.hidePreview()
+	hideDistanceMarker()
+
+	local origCF = ball.CFrame
+	local pts = table.create(#path)
+	for k, smp in path do
+		pts[k] = Vector3.new(smp.pos.X, smp.pos.Y + 0.06, smp.pos.Z)
+	end
+	local clock, i = 0, 1
+	local function finish()
+		RunService:UnbindFromRenderStep("PuttPreviewRoll")
+		task.delay(0.35, function()
+			ball.CFrame = origCF -- return to address
+			PuttGreen.hidePreview() -- clear the trail
+			busy = false
+			puttPreviewing = false
+			RunService:BindToRenderStep("GolfCameraAim", Enum.RenderPriority.Camera.Value, updateAimAndInput)
+			refreshGreenGrid()
+		end)
+	end
+	local function rollStep(frameDt: number)
+		clock += frameDt * PLAYBACK_SPEED
+		while i < #path and path[i + 1].t <= clock do
+			i += 1
+		end
+		if i >= #path then
+			ball.CFrame = CFrame.new(path[#path].pos)
+			PuttGreen.showPreview(pts) -- full breaking trail behind the ball
+			finish()
+			return
+		end
+		local a, b = path[i], path[i + 1]
+		local span = b.t - a.t
+		local fr = if span > 0 then math.clamp((clock - a.t) / span, 0, 1) else 0
+		local sf = fr * fr * (3 - 2 * fr)
+		local now = a.pos:Lerp(b.pos, sf)
+		ball.CFrame = CFrame.new(now)
+		-- grow the tracer trail behind the ball
+		local trail = table.create(i + 1)
+		for k = 1, i do
+			trail[k] = pts[k]
+		end
+		trail[i + 1] = Vector3.new(now.X, now.Y + 0.06, now.Z)
+		PuttGreen.showPreview(trail)
+	end
+	RunService:BindToRenderStep("PuttPreviewRoll", Enum.RenderPriority.Camera.Value, rollStep)
+end
+
 UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 	if gpe then return end
 	local kc = input.KeyCode
+
+	if kc == Enum.KeyCode.V then
+		previewPuttRoll() -- watch the current putt roll out, then return to address
+		return
+	end
 
 	-- Handle Club Selection Exclusively via Q and E Cycling
 	local clubChanged = false
@@ -812,6 +915,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 			distanceFraction = math.clamp(math.sqrt(math.min(cupFt, PUTT_MAX_FT) / PUTT_MAX_FT), PUTT_MIN_POWER, 1.0)
 		end
 
+		refreshGreenGrid() -- putter on the green -> show the break grid; other clubs hide it
 		lastPreviewSig = nil -- Force a visual update of the path tracer line
 		print("Selected Club: " .. currentClub.name .. " | Active Shot Stance: " .. currentShotType().name)
 
