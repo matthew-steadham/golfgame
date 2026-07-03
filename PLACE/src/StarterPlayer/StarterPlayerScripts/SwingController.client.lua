@@ -22,6 +22,9 @@ local SwingConfig = require(Mods.SwingConfig)
 local CourseData = require(Mods.CourseData)
 local Tracers = require(Mods.TracerController)
 local PuttGreen = require(Mods.PuttGreen)
+local RoundState = require(Mods.RoundState)
+local ClubSounds = require(Mods.ClubSounds)
+local ShotDistance = require(Mods.ShotDistance)
 
 -- ===== tunables =====
 -- ===== course data =====
@@ -31,7 +34,7 @@ local FALLBACK_SURFACE = 4         -- surface id used ONLY if GetTerrainData omi
 local COURSE_Y_OFFSET = 0           -- studs subtracted from raw world height; 0 = ball shares the mesh's native frame
 local PIN_XZ = Vector2.new(0, 0)    -- world (x, z) of the cup on the green -- SET THIS
 local PAR = 4                       -- par for this hole (for the scorecard print)
-local AIM_RATE_DEG = 40
+local AIM_RATE_DEG = 15
 local SHAPE_RATE = 1.5
 local CAM_BACK = 6
 local CAM_HEIGHT = 4
@@ -42,7 +45,7 @@ local FOLLOW_BACK = 22
 local FOLLOW_HEIGHT = 8
 local AIM_SMOOTH = 12
 local TRACK_SMOOTH = 2
-local CHASE_Y_SMOOTH = 4
+local CHASE_Y_SMOOTH = 10
 local FLY_IN_TIME = 0.25
 -- ====================
 
@@ -260,6 +263,17 @@ local holes = (courseMarkers and CourseData.load(courseMarkers)) or {}
 local currentHole = 1
 local pendingHole: number? = nil -- set on hole-out; consumed once the putt drops
 
+-- Live round state for the HUD/scorecard (client-side; final result submitted at round end).
+local function currentPar(): number
+	return (holes[currentHole] and holes[currentHole].par) or PAR
+end
+local roundPars = {}
+for i, h in holes do
+	roundPars[i] = h.par
+end
+RoundState.StartRound(HOLE_NAME, roundPars)
+RoundState.StartHole(currentHole, currentPar())
+
 -- Aim from the ball's current lie toward the next strategic point of the hole:
 -- the fairway landing off the tee, advancing to the flag as you move up.
 -- With no markers, aims straight at the cup.
@@ -286,6 +300,7 @@ local function startHole(n: number): boolean
 	ball.Position = TEE
 	ballPos = TEE
 	strokes = 0
+	RoundState.StartHole(n, currentPar())
 	shape = Vector2.zero
 	aimAtTarget()
 	forceSnapNextFrame = true
@@ -301,7 +316,7 @@ local DIST_RATE = 0.1     -- distance-fraction change per second (W/S at address
 local POWER_MIN = 0.75     -- the power dial spans 75%..100% for EVERY shot type
 local POWER_MAX = 1.0      -- shot type changes ball flight (launch/spin), never this range
 local SCOUT_SPEED = 130    -- studs/s the scout cam dollies down the line (W/S in scout)
-local SCOUT_MAX = 450      -- studs the scout cam can travel out
+local SCOUT_MAX = 1000      -- studs the scout cam can travel out
 local SCOUT_BACK = 16
 local SCOUT_HEIGHT = 14
 
@@ -309,6 +324,7 @@ local distanceFraction = 1.0
 local shotTypeIndex = 2    -- default "Approach"
 local scoutMode = false
 local scoutDistance = 60
+local previewCarryStuds = 60 -- expected carry of the current club, refreshed by the aim preview
 
 local function currentShotType()
 	return ShotTypes.Order[shotTypeIndex]
@@ -361,6 +377,31 @@ local PUTT_REST = GroundResolver.REST_SPEED          -- studs/s the ball rests b
 local function isPutt(): boolean
 	return currentClub.name == "Putter"
 end
+
+local function updatePreShot()
+	local bp = ball.Position
+	local surf = terrain(bp.X, bp.Z).surface
+	local toHole = Vector3.new(cupCenter.X - bp.X, 0, cupCenter.Z - bp.Z).Magnitude
+	local count, units
+	if surf == 4 then -- on the green: distance to hole in feet
+		count, units = tostring(math.floor(toHole * (0.28 / 0.3048) + 0.5)), "FT"
+	else
+		count, units = tostring(math.floor(toHole * (0.28 / 0.9144) + 0.5)), "YDS"
+	end
+	local st = currentShotType()
+	Hud.setPreShot({
+		club = currentClub.name, shotTypeId = st.id, shotTypeName = st.name,
+		distance = count, units = units, surfaceId = surf,
+	})
+	Hud.setPreShotPhase(not busy) -- PreShot while aiming; shot-travelled Distance while a shot is live
+end
+
+task.spawn(function()
+	while true do
+		updatePreShot()
+		task.wait(0.1) -- 10 Hz keeps distance-to-hole/lie live as you aim; terrain() is a cheap lookup
+	end
+end)
 
 -- Show the break grid when the player is on the green with the putter; hide it otherwise.
 -- (The grid depends only on terrain, so it is refreshed on rest/club-change, not every frame.)
@@ -535,6 +576,10 @@ local function updateAimAndInput(dt: number)
 		local pathPoints = Ballistics.getProjectionPath(previewLaunch, {
 			groundHeight = function(x, z) return terrain(x, z).height end,
 		}, 12)
+		if #pathPoints > 1 then
+			local landing = pathPoints[#pathPoints]
+			previewCarryStuds = (Vector3.new(landing.X, 0, landing.Z) - Vector3.new(bp.X, 0, bp.Z)).Magnitude
+		end
 
 		local diff = Difficulty.get()
 		if diff.preShotPath then
@@ -653,22 +698,24 @@ local function playback(path: Ballistics.Path)
 			ballPos = endPos
 
 			-- next lie: if the putt just dropped, cut to the next tee; otherwise re-aim from where the ball rests toward the next point of this hole.
-			if pendingHole then
-				local nxt = pendingHole; pendingHole = nil
-				if not startHole(nxt) and not startHole(1) then aimAtTarget() end
-			else
-				aimAtTarget()
-			end
 
 			camera.CameraType = Enum.CameraType.Scriptable
 			camera.CFrame = addressTarget()
 			forceSnapNextFrame = true
 
 			task.defer(function()
-				camera.CameraType = Enum.CameraType.Scriptable
-				camera.CFrame = addressTarget()
 				busy = false
 				postShotTransition() -- shot is done: dissolve HUD, then curtain-cut to next shot
+				ShotDistance.hide()
+				wait(1)
+				if pendingHole then
+					local nxt = pendingHole; pendingHole = nil
+					if not startHole(nxt) and not startHole(1) then aimAtTarget() end
+				else
+					aimAtTarget()
+				end
+				camera.CameraType = Enum.CameraType.Scriptable
+				camera.CFrame = addressTarget()
 				RunService:BindToRenderStep("GolfCameraAim", Enum.RenderPriority.Camera.Value, updateAimAndInput)
 				refreshGreenGrid() -- ball at rest: show the break grid if we are putting on the green
 			end)
@@ -707,7 +754,11 @@ capture.onCompleted = function(swing)
 		return
 	end
 
+	ClubSounds.play(currentClub)
+	wait(0.2)
+	ShotDistance.begin(ball, if isPutt() then "putt" else "shot")
 	strokes += 1
+	RoundState.SetStrokes(strokes)
 	hideDistanceMarker()
 	swinging = false
 	PuttGreen.hideAll() -- putt struck: clear the break grid + aim line immediately
@@ -768,6 +819,7 @@ capture.onCompleted = function(swing)
 		local par = (holes[currentHole] and holes[currentHole].par) or PAR
 		print(string.format("HOLED OUT in %d (par %d) -- %s.",
 			strokes, par, scoreTerm(strokes - par)))
+		RoundState.HoleOut(strokes, par)
 		strokes = 0
 		pendingHole = currentHole + 1 -- consumed when the ball finishes dropping
 	elseif restInfo.water then
@@ -979,12 +1031,14 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 	elseif kc == Enum.KeyCode.C then
 		scoutMode = not scoutMode
 		if scoutMode then
-			scoutDistance = 60
+			scoutDistance = math.clamp(previewCarryStuds, 10, SCOUT_MAX) -- start where this club lands
 			capture:Disarm()
 			clearAdornments()
+			PuttGreen.showGrid(Vector2.new(cupCenter.X, cupCenter.Z), terrain, cupCenter) -- green break while scouting
 			print("Scout cam ON -- W/S dolly, A/D aim, C to return")
 		else
 			capture:Arm()
+			refreshGreenGrid() -- back to normal: grid hidden unless putting on the green
 			forceSnapNextFrame = true
 			lastPreviewSig = nil
 			print("Scout cam OFF")
