@@ -554,6 +554,114 @@ end
 
 applySwingProfile()
 
+local STOCK_PREVIEW_SWING = {
+	valid = true,
+	power = 1.0,
+	tempo = 0.0,
+	overswing = 0.0,
+	contact = 1.0,
+	path = 0.0,
+	faceOffset = 0.0,
+}
+
+local function setShotTypeById(id: string)
+	for idx, shotTypeData in ipairs(ShotTypes.Order) do
+		if shotTypeData.id == id then
+			shotTypeIndex = idx
+			return shotTypeData
+		end
+	end
+	shotTypeIndex = math.min(2, #ShotTypes.Order)
+	return currentShotType()
+end
+
+local function directionToCup(fromPos: Vector3): Vector3
+	local toCup = Vector3.new(cupCenter.X - fromPos.X, 0, cupCenter.Z - fromPos.Z)
+	return if toCup.Magnitude > 1e-4 then toCup.Unit else aimDirection()
+end
+
+local function fullCarryForClub(club: any, shotTypeData: any, fromPos: Vector3, aim: Vector3): number
+	local profile = ShotModel.getProfile(shotTypeData.name)
+	local launch = ShotModel.resolve(STOCK_PREVIEW_SWING, club, {
+		aimDirection = aim,
+		position = fromPos,
+		lie = "fairway",
+		shape = Vector2.zero,
+		seed = 0,
+		powerScale = 1.0,
+		speedMult = profile.speedMult,
+		launchAdd = profile.launchAdd,
+		spinMult = profile.spinMult,
+	})
+	local _, result = Ballistics.simulate(launch, {
+		groundHeight = function(x, z) return terrain(x, z).height end,
+	})
+	return Ballistics.carryStuds(launch, result)
+end
+
+local function resetShotDefaultsForLie()
+	local bp = ball.Position
+	local targetStuds = horizontalDistance(cupCenter, bp)
+	local stockShotType = setShotTypeById("approach")
+	shape = Vector2.zero
+
+	if terrain(bp.X, bp.Z).surface == 4 then
+		currentClub = Clubs.Putter
+		local cupFt = targetStuds / STUDS_PER_FT
+		distanceFraction = math.clamp(math.sqrt(math.min(cupFt, PUTT_MAX_FT) / PUTT_MAX_FT), PUTT_MIN_POWER, 1.0)
+	else
+		local aim = directionToCup(bp)
+		local chosenClub: any? = nil
+		local chosenPower = POWER_MAX
+		local shortestClub: any? = nil
+		local shortestCarry = math.huge
+		local longestClub: any? = nil
+		local longestCarry = -math.huge
+
+		for idx = #clubOrder, 1, -1 do
+			local club = clubOrder[idx]
+			if club.name ~= "Putter" then
+				local carry = fullCarryForClub(club, stockShotType, bp, aim)
+				if carry < shortestCarry then
+					shortestCarry = carry
+					shortestClub = club
+				end
+				if carry > longestCarry then
+					longestCarry = carry
+					longestClub = club
+				end
+				if targetStuds <= carry then
+					local power = math.sqrt(math.max(targetStuds, 0) / math.max(carry, 1e-3))
+					if power >= POWER_MIN then
+						chosenClub = club
+						chosenPower = math.clamp(power, POWER_MIN, POWER_MAX)
+						break
+					end
+				end
+			end
+		end
+
+		if chosenClub then
+			currentClub = chosenClub
+			distanceFraction = chosenPower
+		elseif targetStuds > longestCarry and longestClub then
+			currentClub = longestClub
+			distanceFraction = POWER_MAX
+		elseif shortestClub then
+			currentClub = shortestClub
+			distanceFraction = POWER_MIN
+		else
+			currentClub = Clubs.Iron7
+			distanceFraction = stockShotType.defaultFrac
+		end
+	end
+
+	applySwingProfile()
+	capture.targetFraction = distanceFraction
+	lastPreviewSig = nil
+	updatePreShot()
+end
+
 -- Data-only: where a perfectly-struck shot with the current club/aim/shape/dial lands.
 -- Returns (landing: Vector3?, carryStuds: number). No rendering (used for scout live data + start).
 local function previewLanding(): (Vector3?, number)
@@ -561,7 +669,7 @@ local function previewLanding(): (Vector3?, number)
 	local profile = ShotModel.getProfile(st.name)
 	local bp = ball.Position
 	local launch = ShotModel.resolve(
-		{ valid = true, power = 1.0, tempo = 0.0, overswing = 0.0, contact = 1.0, path = 0.0, faceOffset = 0.0 },
+		STOCK_PREVIEW_SWING,
 		currentClub, {
 			aimDirection = aimDirection(), position = bp, lie = "fairway", shape = shape,
 			seed = 0, powerScale = distanceFraction,
@@ -685,21 +793,11 @@ local function updateAimAndInput(dt: number)
 			return
 		end
 
-		local previewSwing = {
-			valid = true,
-			power = 1.0,
-			tempo = 0.0, -- perfect rhythm: preview shows the full dialed distance
-			overswing = 0.0,
-			contact = 1.0,
-			path = 0.0,
-			faceOffset = 0.0,
-		}
-
 		local st = currentShotType()
 		-- DYNAMIC CHANGE: Fetch PGA 2K25 integrated physics multipliers via the profile table
 		local profile = ShotModel.getProfile(st.name)
 
-		local previewLaunch = ShotModel.resolve(previewSwing, currentClub, {
+		local previewLaunch = ShotModel.resolve(STOCK_PREVIEW_SWING, currentClub, {
 			aimDirection = aimDirection(),
 			position = bp,
 			lie = "fairway",
@@ -864,6 +962,7 @@ local function playback(path: Ballistics.Path, completedStrokes: number?, comple
 						else
 							aimAtTarget()
 						end
+						resetShotDefaultsForLie()
 						camera.CameraType = Enum.CameraType.Scriptable
 						camera.CFrame = addressTarget()
 					end, function()
@@ -882,6 +981,7 @@ local function playback(path: Ballistics.Path, completedStrokes: number?, comple
 					postShotTransition(function() -- shot is done: dissolve HUD, then curtain-cut to next shot
 						RoundState.SetStrokes(strokes)
 						aimAtTarget()
+						resetShotDefaultsForLie()
 						task.defer(function()
 							Hud.fadeHoleStatCardIn()
 						end)
@@ -1220,6 +1320,8 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 			camera.CFrame = addressTarget()
 			clearAdornments()
 		end
+		resetShotDefaultsForLie()
+		refreshGreenGrid()
 	end
 end)
 
@@ -1229,3 +1331,5 @@ if not startHole(1) then
 	forceSnapNextFrame = true
 	camera.CFrame = addressTarget()
 end
+resetShotDefaultsForLie()
+refreshGreenGrid()
