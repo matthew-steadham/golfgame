@@ -685,6 +685,15 @@ local function hscCategory(rel: number): string
 	else return "TripleOrWorse" end
 end
 
+local function hscLanguage(rel: number): string
+	if rel == 4 then
+		return "QUAD BOGEY"
+	elseif rel >= 5 then
+		return "QUAD BOGEY+"
+	end
+	return HSC_LANG[hscCategory(rel)] or "PAR"
+end
+
 -- Update the always-on per-hole shot tracker. info = { shot, par, hole, toParText }
 -- shot = the shot number the player is currently on (strokes taken + 1).
 local function setHoleStatCard(info)
@@ -696,7 +705,7 @@ local function setHoleStatCard(info)
 	if evo.hscHoleNumber and evo.hscHoleNumber:IsA("TextLabel") then evo.hscHoleNumber.Text = tostring(info.hole) end
 	if evo.hscScoreDiff and evo.hscScoreDiff:IsA("TextLabel") then evo.hscScoreDiff.Text = info.toParText or "" end
 	if evo.hscLanguage and evo.hscLanguage:IsA("TextLabel") then
-		evo.hscLanguage.Text = "FOR " .. (HSC_LANG[hscCategory(rel)] or "PAR")
+		evo.hscLanguage.Text = "FOR " .. hscLanguage(rel)
 	end
 
 	-- number row: 1..par visible; exactly one highlighted (current shot, or After when over par)
