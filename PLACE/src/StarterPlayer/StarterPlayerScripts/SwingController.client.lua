@@ -132,6 +132,10 @@ end
 buildPin(cupCenter)
 
 local player = Players.LocalPlayer
+local ROUND_HUD_HOLD_ATTR = "RoundHudHoldMainUpdates"
+local ROUND_HUD_HIDE_SCORECARD_ATTR = "RoundHudHideScorecardRequest"
+player:SetAttribute(ROUND_HUD_HOLD_ATTR, false)
+player:SetAttribute(ROUND_HUD_HIDE_SCORECARD_ATTR, 0)
 local camera = workspace.CurrentCamera
 camera.CameraType = Enum.CameraType.Scriptable
 
@@ -161,21 +165,6 @@ ball.Position = TEE
 ball.Parent = workspace
 
 -- HUD
-local gui = Instance.new("ScreenGui")
-gui.Name = "SwingHUD"
-gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
-local label = Instance.new("TextLabel")
-label.Size = UDim2.fromOffset(380, 48)
-label.Position = UDim2.fromOffset(16, 16)
-label.BackgroundColor3 = Color3.new(0, 0, 0)
-label.BackgroundTransparency = 0.45
-label.TextColor3 = Color3.new(1, 1, 1)
-label.TextXAlignment = Enum.TextXAlignment.Left
-label.TextYAlignment = Enum.TextYAlignment.Top
-label.Font = Enum.Font.Code
-label.TextSize = 16
-label.Parent = gui
 
 -- Dynamically compile and sort the club bag from the Clubs module
 local clubOrder = {}
@@ -311,13 +300,116 @@ local function startHole(n: number): boolean
 	return true
 end
 
+-- Between-hole scorecard camera: a temporary invisible part does a short pan around the
+-- completed green. The ScoreCard GUI is driven by RoundHud.HoleCompleted and stays visible.
+local BETWEEN_HOLE_GAP = 5.0
+local BETWEEN_HOLE_CAMERA_TIME = BETWEEN_HOLE_GAP
+local BETWEEN_HOLE_UI_FADE_DELAY = 1
+local BETWEEN_HOLE_UI_FADE_TIME = 1
+local BETWEEN_HOLE_SCORECARD_FADE_TIME = 1
+local HOLE_START_UI_FADE_BUFFER = 0.35
+local BETWEEN_HOLE_CAMERA_FOV = 40
+local BETWEEN_HOLE_CAMERA_HEIGHT = 5
+local BETWEEN_HOLE_CAMERA_LOOK_HEIGHT = 5
+local BETWEEN_HOLE_CAMERA_VIEW_DISTANCE = 50
+local BETWEEN_HOLE_CAMERA_SIDE_PAN = 0
+local BETWEEN_HOLE_CAMERA_YAW_DEG = 5
+local BETWEEN_HOLE_CAMERA_RENDER = "GolfBetweenHoleCamera"
+
+local function worldAtXZ(xz: Vector2, yOffset: number): Vector3
+	local t = terrain(xz.X, xz.Y)
+	return Vector3.new(xz.X, t.height + yOffset, xz.Y)
+end
+
+local function playBetweenHoleCamera()
+	local greenXZ = Vector2.new(cupCenter.X, cupCenter.Z)
+	local aim = aimDirection()
+	local dir = Vector2.new(aim.X, aim.Z)
+	if dir.Magnitude < 0.001 then
+		dir = Vector2.new(0, 1)
+	else
+		dir = dir.Unit
+	end
+	local side = Vector2.new(-dir.Y, dir.X)
+	local centerXZ = greenXZ - dir * BETWEEN_HOLE_CAMERA_VIEW_DISTANCE
+	local panHalf = BETWEEN_HOLE_CAMERA_SIDE_PAN * 0.5
+	local startXZ = centerXZ - side * panHalf
+	local endXZ = centerXZ + side * panHalf
+	local startPos = worldAtXZ(startXZ, BETWEEN_HOLE_CAMERA_HEIGHT)
+	local endDelta = endXZ - startXZ
+	local endPos = startPos + Vector3.new(endDelta.X, 0, endDelta.Y)
+	local focus = worldAtXZ(greenXZ, BETWEEN_HOLE_CAMERA_LOOK_HEIGHT)
+	local centerPos = worldAtXZ(centerXZ, BETWEEN_HOLE_CAMERA_HEIGHT)
+	local baseLook = focus - centerPos
+	local baseHorizontal = Vector3.new(baseLook.X, 0, baseLook.Z)
+	if baseHorizontal.Magnitude < 0.001 then
+		baseHorizontal = Vector3.new(dir.X, 0, dir.Y)
+	end
+	baseHorizontal = baseHorizontal.Unit
+	local baseHorizontalDistance = math.max(Vector3.new(baseLook.X, 0, baseLook.Z).Magnitude, 1)
+	local baseVerticalOffset = baseLook.Y
+	local oldFov = camera.FieldOfView
+
+	local old = workspace:FindFirstChild("BetweenHoleCamera")
+	if old then old:Destroy() end
+
+	local camPart = Instance.new("Part")
+	camPart.Name = "BetweenHoleCamera"
+	camPart.Anchored = true
+	camPart.CanCollide = false
+	camPart.CanQuery = false
+	camPart.CanTouch = false
+	camPart.Transparency = 1
+	camPart.Size = Vector3.one
+	camPart.Position = startPos
+	camPart.Parent = workspace
+
+	RunService:UnbindFromRenderStep(BETWEEN_HOLE_CAMERA_RENDER)
+	local started = os.clock()
+	local function updateTransitionCamera()
+		local alpha = math.clamp((os.clock() - started) / BETWEEN_HOLE_CAMERA_TIME, 0, 1)
+		local yaw = math.rad(-BETWEEN_HOLE_CAMERA_YAW_DEG * 0.5 + BETWEEN_HOLE_CAMERA_YAW_DEG * alpha)
+		local lookHorizontal = CFrame.fromAxisAngle(Vector3.yAxis, yaw):VectorToWorldSpace(baseHorizontal)
+		local lookAt = camPart.Position + lookHorizontal * baseHorizontalDistance + Vector3.new(0, baseVerticalOffset, 0)
+		local cf = CFrame.lookAt(camPart.Position, lookAt)
+		camPart.CFrame = cf
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.FieldOfView = BETWEEN_HOLE_CAMERA_FOV
+		camera.CFrame = cf
+	end
+
+	updateTransitionCamera()
+	RunService:BindToRenderStep(BETWEEN_HOLE_CAMERA_RENDER, Enum.RenderPriority.Camera.Value, updateTransitionCamera)
+
+	local done = false
+	local tween = TweenService:Create(
+		camPart,
+		TweenInfo.new(BETWEEN_HOLE_CAMERA_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{ Position = endPos }
+	)
+	tween.Completed:Once(function()
+		done = true
+	end)
+	tween:Play()
+
+	local waitStarted = os.clock()
+	while not done and camPart.Parent and os.clock() - waitStarted < BETWEEN_HOLE_CAMERA_TIME + 0.5 do
+		RunService.Heartbeat:Wait()
+	end
+	RunService:UnbindFromRenderStep(BETWEEN_HOLE_CAMERA_RENDER)
+	camera.FieldOfView = oldFov
+	if camPart.Parent then
+		camPart:Destroy()
+	end
+end
+
 -- ===== shot type, distance dial, scout cam =====
 local DIST_RATE = 0.1     -- distance-fraction change per second (W/S at address)
 local POWER_MIN = 0.75     -- the power dial spans 75%..100% for EVERY shot type
 local POWER_MAX = 1.0      -- shot type changes ball flight (launch/spin), never this range
 local SCOUT_SPEED = 130    -- studs/s the scout cam dollies down the line (W/S in scout)
 local SCOUT_MAX = 1000      -- studs the scout cam can travel out
-local SCOUT_BACK = 16
+local SCOUT_BACK = 20
 local SCOUT_HEIGHT = 14
 
 local distanceFraction = 1.0
@@ -378,6 +470,16 @@ local function isPutt(): boolean
 	return currentClub.name == "Putter"
 end
 
+local function syncGreenShotLanguage()
+	local bp = ball.Position
+	local onGreen = terrain(bp.X, bp.Z).surface == 4
+	if onGreen and not busy and not scoutMode and not pendingHole then
+		Hud.tweenShotLanguageIn()
+	else
+		Hud.tweenShotLanguageOut()
+	end
+end
+
 local function updatePreShot()
 	local bp = ball.Position
 	local surf = terrain(bp.X, bp.Z).surface
@@ -394,6 +496,9 @@ local function updatePreShot()
 		distance = count, units = units, surfaceId = surf,
 	})
 	Hud.setPreShotPhase(not busy) -- PreShot while aiming; shot-travelled Distance while a shot is live
+	if not busy then
+		syncGreenShotLanguage()
+	end
 end
 
 task.spawn(function()
@@ -406,11 +511,14 @@ end)
 -- Show the break grid when the player is on the green with the putter; hide it otherwise.
 -- (The grid depends only on terrain, so it is refreshed on rest/club-change, not every frame.)
 local function refreshGreenGrid()
-	if isPutt() and terrain(ball.Position.X, ball.Position.Z).surface == 4 then
+	if scoutMode then
+		PuttGreen.showGrid(Vector2.new(cupCenter.X, cupCenter.Z), terrain, cupCenter) -- green break while scouting
+	elseif isPutt() and terrain(ball.Position.X, ball.Position.Z).surface == 4 then
 		PuttGreen.showGrid(Vector2.new(ball.Position.X, ball.Position.Z), terrain, cupCenter)
 	else
 		PuttGreen.hideGrid()
 	end
+	syncGreenShotLanguage()
 end
 
 -- launch speed (studs/s) that rolls `distStuds` on flat green: inverse of the roll integrator
@@ -440,36 +548,63 @@ end
 
 applySwingProfile()
 
-local function updateHUD()
-	if isPutt() then
-		local ft = puttReachFt(distanceFraction)
-		local val, unit = ft, "ft"
-		if ft < 1 then val, unit = ft * 12, "in" end
-		label.Text = string.format("Club: Putter\nAim: %d %s  (%d%%)", math.floor(val + 0.5), unit, math.floor(distanceFraction * 100 + 0.5))
-	else
-		label.Text = string.format(
-			"Club: %s   Shot: %s\nDist: %d%%   Shape: %s",
-			currentClub.name, currentShotType().name,
-			math.floor(distanceFraction * 100 + 0.5), ShotShape.describe(shape.X, shape.Y)
-		)
+-- Data-only: where a perfectly-struck shot with the current club/aim/shape/dial lands.
+-- Returns (landing: Vector3?, carryStuds: number). No rendering (used for scout live data + start).
+local function previewLanding(): (Vector3?, number)
+	local st = currentShotType()
+	local profile = ShotModel.getProfile(st.name)
+	local bp = ball.Position
+	local launch = ShotModel.resolve(
+		{ valid = true, power = 1.0, tempo = 0.0, overswing = 0.0, contact = 1.0, path = 0.0, faceOffset = 0.0 },
+		currentClub, {
+			aimDirection = aimDirection(), position = bp, lie = "fairway", shape = shape,
+			seed = 0, powerScale = distanceFraction,
+			speedMult = profile.speedMult, launchAdd = profile.launchAdd, spinMult = profile.spinMult,
+		})
+	local path = Ballistics.getProjectionPath(launch, {
+		groundHeight = function(x, z) return terrain(x, z).height end,
+	}, 12)
+	if #path > 1 then
+		local landing = path[#path]
+		return landing, (Vector3.new(landing.X, 0, landing.Z) - Vector3.new(bp.X, 0, bp.Z)).Magnitude
 	end
+	return nil, 0
 end
 
 local function updateAimAndInput(dt: number)
 	if busy then return end
 
 	if scoutMode then
-		local aim = aimDirection()
-		if UserInputService:IsKeyDown(Enum.KeyCode.W) then scoutDistance += SCOUT_SPEED * dt end
-		if UserInputService:IsKeyDown(Enum.KeyCode.S) then scoutDistance -= SCOUT_SPEED * dt end
-		scoutDistance = math.clamp(scoutDistance, 10, SCOUT_MAX)
-		if UserInputService:IsKeyDown(Enum.KeyCode.A) then aimYaw -= math.rad(AIM_RATE_DEG) * dt end
-		if UserInputService:IsKeyDown(Enum.KeyCode.D) then aimYaw += math.rad(AIM_RATE_DEG) * dt end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+			-- Shift+WASD shapes the shot (draw/fade + trajectory), same as at address
+			local r = SHAPE_RATE * dt
+			local x, y = shape.X, shape.Y
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then x -= r end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then x += r end
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then y += r end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then y -= r end
+			shape = Vector2.new(math.clamp(x, -1, 1), math.clamp(y, -1, 1))
+		else
+			-- no Shift: W/S dolly the camera, A/D aim
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then scoutDistance += SCOUT_SPEED * dt end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then scoutDistance -= SCOUT_SPEED * dt end
+			scoutDistance = math.clamp(scoutDistance, 10, SCOUT_MAX)
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then aimYaw -= math.rad(AIM_RATE_DEG) * dt end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then aimYaw += math.rad(AIM_RATE_DEG) * dt end
+		end
+		-- live carry data as club/aim/shape change: the number + landing, no flight line
+		local landing, carryStuds = previewLanding()
+		if carryStuds > 0 then previewCarryStuds = carryStuds end
+		if landing then
+			showDistanceMarker(landing, math.floor(Ballistics.studsToYards(carryStuds) + 0.5))
+		else
+			hideDistanceMarker()
+		end
+		local aim = aimDirection() -- recomputed after aim may have changed this frame
 		local f = ball.Position + aim * scoutDistance
 		local focus = Vector3.new(f.X, terrain(f.X, f.Z).height, f.Z)
 		camera.CFrame = CFrame.lookAt(focus - aim * SCOUT_BACK + Vector3.new(0, SCOUT_HEIGHT, 0), focus + aim * 25)
 		setMeterVisible(false)
-		updateHUD()
 		return
 	end
 
@@ -513,7 +648,6 @@ local function updateAimAndInput(dt: number)
 	end
 
 	updateCamera(dt)
-	updateHUD()
 
 	-- Real-time path preview. Only re-simulate when an input actually changes;
 	-- when lined up and still this does zero flight sims per frame.
@@ -601,7 +735,8 @@ end
 
 RunService:BindToRenderStep("GolfCameraAim", Enum.RenderPriority.Camera.Value, updateAimAndInput)
 
-local function playback(path: Ballistics.Path)
+local function playback(path: Ballistics.Path, completedStrokes: number?, completedPar: number?)
+	local holeCompleted = completedStrokes ~= nil and completedPar ~= nil
 	busy = true
 	RunService:UnbindFromRenderStep("GolfCameraAim")
 	clearAdornments()
@@ -704,18 +839,59 @@ local function playback(path: Ballistics.Path)
 			forceSnapNextFrame = true
 
 			task.defer(function()
-				busy = false
-				postShotTransition() -- shot is done: dissolve HUD, then curtain-cut to next shot
-				ShotDistance.hide()
-				wait(1)
-				if pendingHole then
-					local nxt = pendingHole; pendingHole = nil
-					if not startHole(nxt) and not startHole(1) then aimAtTarget() end
+				if holeCompleted then
+					player:SetAttribute(ROUND_HUD_HOLD_ATTR, true)
+					RoundState.HoleOut(completedStrokes :: number, completedPar :: number)
+					task.spawn(playBetweenHoleCamera)
+					task.wait(BETWEEN_HOLE_UI_FADE_DELAY)
+					Hud.tweenHoleNumbersOut()
+					Hud.tweenShotLanguageOut()
+					Hud.fadeMainOut(BETWEEN_HOLE_UI_FADE_TIME)
+					task.wait(math.max(BETWEEN_HOLE_GAP - BETWEEN_HOLE_UI_FADE_DELAY - BETWEEN_HOLE_SCORECARD_FADE_TIME, BETWEEN_HOLE_UI_FADE_TIME))
+					player:SetAttribute(ROUND_HUD_HIDE_SCORECARD_ATTR, os.clock())
+					task.wait(BETWEEN_HOLE_SCORECARD_FADE_TIME)
+					Hud.setMainVisible(false)
+
+					local transitionDone = false
+					Hud.playBlackScreenTransition(function()
+						ShotDistance.hide()
+						strokes = 0
+						if pendingHole then
+							local nxt = pendingHole; pendingHole = nil
+							if not (startHole(nxt) or startHole(1)) then aimAtTarget() end
+						else
+							aimAtTarget()
+						end
+						camera.CameraType = Enum.CameraType.Scriptable
+						camera.CFrame = addressTarget()
+					end, function()
+						transitionDone = true
+					end)
+					while not transitionDone do
+						RunService.Heartbeat:Wait()
+					end
+					task.wait(HOLE_START_UI_FADE_BUFFER)
+					Hud.fadeHoleStatCardIn()
+					player:SetAttribute(ROUND_HUD_HOLD_ATTR, false)
 				else
-					aimAtTarget()
+					busy = false
+					ShotDistance.hide()
+					local shotUiReady = false
+					postShotTransition(function() -- shot is done: dissolve HUD, then curtain-cut to next shot
+						RoundState.SetStrokes(strokes)
+						aimAtTarget()
+						task.defer(function()
+							Hud.fadeHoleStatCardIn()
+						end)
+						shotUiReady = true
+					end)
+					while not shotUiReady do
+						RunService.Heartbeat:Wait()
+					end
 				end
 				camera.CameraType = Enum.CameraType.Scriptable
 				camera.CFrame = addressTarget()
+				busy = false
 				RunService:BindToRenderStep("GolfCameraAim", Enum.RenderPriority.Camera.Value, updateAimAndInput)
 				refreshGreenGrid() -- ball at rest: show the break grid if we are putting on the green
 			end)
@@ -741,24 +917,16 @@ capture.onUpdated = function(state)
 	end
 end
 
-local function scoreTerm(rel: number): string
-	local names = {
-		[-3] = "albatross", [-2] = "eagle", [-1] = "birdie",
-		[0] = "par", [1] = "bogey", [2] = "double bogey", [3] = "triple bogey",
-	}
-	return names[rel] or string.format("%+d", rel)
-end
-
 capture.onCompleted = function(swing)
 	if busy or not swing.valid then
 		return
 	end
 
+	Hud.snapHoleStatCardInvisible()
 	ClubSounds.play(currentClub)
 	wait(0.2)
 	ShotDistance.begin(ball, if isPutt() then "putt" else "shot")
 	strokes += 1
-	RoundState.SetStrokes(strokes)
 	hideDistanceMarker()
 	swinging = false
 	PuttGreen.hideAll() -- putt struck: clear the break grid + aim line immediately
@@ -815,20 +983,15 @@ capture.onCompleted = function(swing)
 		flightPath, restInfo = fp, ri
 	end
 
+	local completedStrokes: number? = nil
+	local completedPar: number? = nil
 	if restInfo.holed then
 		local par = (holes[currentHole] and holes[currentHole].par) or PAR
-		print(string.format("HOLED OUT in %d (par %d) -- %s.",
-			strokes, par, scoreTerm(strokes - par)))
-		RoundState.HoleOut(strokes, par)
-		strokes = 0
+		completedStrokes = strokes
+		completedPar = par
 		pendingHole = currentHole + 1 -- consumed when the ball finishes dropping
-	elseif restInfo.water then
-		print("In the water.")
-	elseif restInfo.outOfBounds then
-		print("Out of bounds.")
 	end
-
-	playback(flightPath)
+	playback(flightPath, completedStrokes, completedPar)
 end
 
 capture.onCancelled = function() setPowerRing(0) resetSwingFeedback() swinging = false end
@@ -856,6 +1019,7 @@ local function previewPuttRoll()
 	busy = true
 	RunService:UnbindFromRenderStep("GolfCameraAim")
 	clearAdornments()
+	PuttGreen.hideGrid()
 	PuttGreen.hidePreview()
 	hideDistanceMarker()
 
@@ -969,7 +1133,6 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 
 		refreshGreenGrid() -- putter on the green -> show the break grid; other clubs hide it
 		lastPreviewSig = nil -- Force a visual update of the path tracer line
-		print("Selected Club: " .. currentClub.name .. " | Active Shot Stance: " .. currentShotType().name)
 
 	elseif kc == Enum.KeyCode.Z or kc == Enum.KeyCode.X then
 		-- 1) Determine allowed shot IDs based on the club name string matching rules
@@ -1026,7 +1189,6 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 		distanceFraction = activeStance.defaultFrac
 
 		lastPreviewSig = nil -- Flushes path tracer cache to re-simulate mechanics instantly
-		print("Shot type changed to: " .. activeStance.name .. " (Range: " .. tostring(activeStance.minFrac*100) .. "% - " .. tostring(activeStance.maxFrac*100) .. "%)")
 
 	elseif kc == Enum.KeyCode.C then
 		scoutMode = not scoutMode
@@ -1034,22 +1196,18 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 			scoutDistance = math.clamp(previewCarryStuds, 10, SCOUT_MAX) -- start where this club lands
 			capture:Disarm()
 			clearAdornments()
-			PuttGreen.showGrid(Vector2.new(cupCenter.X, cupCenter.Z), terrain, cupCenter) -- green break while scouting
-			print("Scout cam ON -- W/S dolly, A/D aim, C to return")
+			refreshGreenGrid() -- scout-aware: shows the green break (scoutMode is true here)
 		else
 			capture:Arm()
 			refreshGreenGrid() -- back to normal: grid hidden unless putting on the green
 			forceSnapNextFrame = true
 			lastPreviewSig = nil
-			print("Scout cam OFF")
 		end
 	elseif kc == Enum.KeyCode.T then
 		diffIndex = (diffIndex % #Difficulty.Order) + 1
 		Difficulty.set(Difficulty.Order[diffIndex])
 		capture.sensitivity = Difficulty.get().swingSensitivity
 		lastPreviewSig = nil 
-		local d = Difficulty.get()
-		print(string.format("Difficulty: %s (%.2fx, Swing Bias %s)", d.name, d.scoreMultiplier, d.swingBias and "ON" or "OFF"))
 	elseif kc == Enum.KeyCode.R then
 		if not startHole(currentHole) then
 			ball.Position = TEE
@@ -1071,5 +1229,3 @@ if not startHole(1) then
 	forceSnapNextFrame = true
 	camera.CFrame = addressTarget()
 end
-
-print(string.format("Ready -- A/D aim, W/S distance, Shift+WASD shape, LMB swing. 1-5 club, G shot type, C scout, T difficulty (%s), R reset.", Difficulty.get().name))
