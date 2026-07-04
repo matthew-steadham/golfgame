@@ -12,6 +12,8 @@ local ClubSounds = {}
 -- Where your six named Sound instances live. Change this if you keep them somewhere else
 -- (e.g. ReplicatedStorage:WaitForChild("Sounds")).
 local SOUND_CONTAINER: Instance = SoundService
+local templateCache: { [string]: Sound } = {}
+local warnedMissing: { [string]: boolean } = {}
 
 -- Map a club (by display name) to its sound category. Names are matched loosely so "3-Wood",
 -- "5-Iron", "P Wedge", etc. all resolve. Add cases here if you introduce oddly-named clubs.
@@ -33,6 +35,25 @@ local function categoryFor(club: { name: string }): string?
 	return nil
 end
 
+local function getTemplate(category: string): Sound?
+	local cached = templateCache[category]
+	if cached and cached.Parent then
+		return cached
+	end
+
+	local template = SOUND_CONTAINER:FindFirstChild(category)
+	if template and template:IsA("Sound") then
+		templateCache[category] = template
+		return template
+	end
+
+	if not warnedMissing[category] then
+		warn(`[ClubSounds] missing Sound "{category}" in {SOUND_CONTAINER:GetFullName()}`)
+		warnedMissing[category] = true
+	end
+	return nil
+end
+
 function ClubSounds.play(club: { name: string }?)
 	if not club then
 		return
@@ -41,9 +62,8 @@ function ClubSounds.play(club: { name: string }?)
 	if not category then
 		return
 	end
-	local template = SOUND_CONTAINER:FindFirstChild(category)
-	if not template or not template:IsA("Sound") then
-		warn(`[ClubSounds] missing Sound "{category}" in {SOUND_CONTAINER:GetFullName()}`)
+	local template = getTemplate(category)
+	if not template then
 		return
 	end
 	-- Clone-and-play so overlapping shots don't restart a single instance.

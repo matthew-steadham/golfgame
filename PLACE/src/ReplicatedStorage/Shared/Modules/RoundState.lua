@@ -3,22 +3,7 @@
 -- Changed. This is NOT persisted -- only the final result is submitted to the server at round end.
 
 local ScoreUtil = require(script.Parent.ScoreUtil)
-
--- Tiny by-reference signal (a BindableEvent would deep-copy payloads; see DataService note).
-local Signal = {}
-Signal.__index = Signal
-function Signal.new()
-	return setmetatable({ _h = {} }, Signal)
-end
-function Signal:Connect(fn)
-	self._h[fn] = true
-	return { Disconnect = function() self._h[fn] = nil end }
-end
-function Signal:Fire(...)
-	for fn in self._h do
-		task.spawn(fn, ...)
-	end
-end
+local Signal = require(script.Parent.Signal)
 
 export type HoleResult = { hole: number, par: number, strokes: number }
 

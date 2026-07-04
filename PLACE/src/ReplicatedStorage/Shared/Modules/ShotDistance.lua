@@ -9,20 +9,7 @@
 
 local RunService = game:GetService("RunService")
 
-local Signal = {}
-Signal.__index = Signal
-function Signal.new()
-	return setmetatable({ _h = {} }, Signal)
-end
-function Signal:Connect(fn)
-	self._h[fn] = true
-	return { Disconnect = function() self._h[fn] = nil end }
-end
-function Signal:Fire(...)
-	for fn in self._h do
-		task.spawn(fn, ...)
-	end
-end
+local Signal = require(script.Parent.Signal)
 
 local YARDS_PER_STUD = 0.28 / 0.9144
 local FEET_PER_STUD = 0.28 / 0.3048
@@ -36,7 +23,9 @@ local origin = Vector3.zero -- ball position at impact; distance is measured str
 local mode = "shot"
 
 local function horiz(a: Vector3, b: Vector3): number
-	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude -- yardage is horizontal only
+	local dx = a.X - b.X
+	local dz = a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz) -- yardage is horizontal only
 end
 
 local function textFor(distStuds: number): (string, string)
@@ -69,20 +58,20 @@ function ShotDistance.begin(ball: BasePart?, shotMode: string?)
 	local lastCount, lastUnit = textFor(0)
 	ShotDistance.Changed:Fire(lastCount, lastUnit) -- show 0 immediately on the hit
 
-	local stable = 0
-	conn = RunService.Heartbeat:Connect(function()
+	local stableTime = 0
+	conn = RunService.Heartbeat:Connect(function(dt)
 		if not ball.Parent then
 			ShotDistance.stop()
 			return
 		end
 		local count, unit = textFor(horiz(ball.Position, origin))
 		if count == lastCount and unit == lastUnit then
-			stable += 1
-			if stable > 60 then -- ~1s after the number stops changing, the ball has rested
+			stableTime += dt
+			if stableTime > 1 then -- about 1s after the number stops changing, the ball has rested
 				ShotDistance.stop()
 			end
 		else
-			stable = 0
+			stableTime = 0
 			lastCount, lastUnit = count, unit
 			ShotDistance.Changed:Fire(count, unit)
 		end

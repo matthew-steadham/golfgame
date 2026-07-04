@@ -223,6 +223,12 @@ local function aimDirection(): Vector3
 	return Vector3.new(math.sin(aimYaw), 0, math.cos(aimYaw))
 end
 
+local function horizontalDistance(a: Vector3, b: Vector3): number
+	local dx = a.X - b.X
+	local dz = a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
 local function addressTarget(): CFrame
 	local aim = aimDirection()
 	local currentBallPos = ball.Position
@@ -483,7 +489,7 @@ end
 local function updatePreShot()
 	local bp = ball.Position
 	local surf = terrain(bp.X, bp.Z).surface
-	local toHole = Vector3.new(cupCenter.X - bp.X, 0, cupCenter.Z - bp.Z).Magnitude
+	local toHole = horizontalDistance(cupCenter, bp)
 	local count, units
 	if surf == 4 then -- on the green: distance to hole in feet
 		count, units = tostring(math.floor(toHole * (0.28 / 0.3048) + 0.5)), "FT"
@@ -566,7 +572,7 @@ local function previewLanding(): (Vector3?, number)
 	}, 12)
 	if #path > 1 then
 		local landing = path[#path]
-		return landing, (Vector3.new(landing.X, 0, landing.Z) - Vector3.new(bp.X, 0, bp.Z)).Magnitude
+		return landing, horizontalDistance(landing, bp)
 	end
 	return nil, 0
 end
@@ -608,17 +614,14 @@ local function updateAimAndInput(dt: number)
 		return
 	end
 
-	local shapeChanged = false
 	if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
 		local r = SHAPE_RATE * dt
 		local x, y = shape.X, shape.Y
-		local oldX = x
 		if UserInputService:IsKeyDown(Enum.KeyCode.A) then x -= r end
 		if UserInputService:IsKeyDown(Enum.KeyCode.D) then x += r end
 		if UserInputService:IsKeyDown(Enum.KeyCode.W) then y += r end
 		if UserInputService:IsKeyDown(Enum.KeyCode.S) then y -= r end
 		shape = Vector2.new(math.clamp(x, -1, 1), math.clamp(y, -1, 1))
-		if math.abs(oldX - x) > 0.001 then shapeChanged = true end
 	else
 		if UserInputService:IsKeyDown(Enum.KeyCode.A) then aimYaw -= math.rad(AIM_RATE_DEG) * dt end
 		if UserInputService:IsKeyDown(Enum.KeyCode.D) then aimYaw += math.rad(AIM_RATE_DEG) * dt end
@@ -634,10 +637,11 @@ local function updateAimAndInput(dt: number)
 	end
 
 	-- Swing Bias: only Pro+ requires the angled swing path. On lower tiers the swing is strictly vertical and the dialed shape still applies to the ball automatically.
-	local tiltDeg = Difficulty.get().swingBias and (shape.X * MAX_SWING_TILT_DEG) or 0
+	local diff = Difficulty.get()
+	local tiltDeg = diff.swingBias and (shape.X * MAX_SWING_TILT_DEG) or 0
 	capture.swingTilt = math.rad(tiltDeg)
 	setShapeAngle(tiltDeg)
-	setMeterVisible(Difficulty.get().swingMeter)
+	setMeterVisible(diff.swingMeter)
 	setPowerLabel()
 	setPowerTarget() -- guide ring sits at the dialed power so you can see where to stop
 	capture.targetFraction = distanceFraction -- the fill reaches this dialed power in FullBackswingTime
@@ -654,15 +658,15 @@ local function updateAimAndInput(dt: number)
 	local bp = ball.Position
 	local sig = string.format(
 		"%.4f|%.3f|%.3f|%s|%.2f|%.2f|%.2f|%s|%.3f|%d",
-		aimYaw, shape.X, shape.Y, currentClub.name, bp.X, bp.Y, bp.Z, Difficulty.get().name,
+		aimYaw, shape.X, shape.Y, currentClub.name, bp.X, bp.Y, bp.Z, diff.name,
 		distanceFraction, shotTypeIndex
 	)
 	if sig ~= lastPreviewSig then
 		lastPreviewSig = sig
 		if isPutt() then
 			clearAdornments() -- putts never use the shot tracer
-			local onGreen = terrain(ball.Position.X, ball.Position.Z).surface == 4
-			if Difficulty.get().preShotPath and onGreen then
+			local onGreen = terrain(bp.X, bp.Z).surface == 4
+			if diff.preShotPath and onGreen then
 				-- Normal aiming, like any other club: a straight aim line to the flat reach at the
 				-- current dial. Read the break off the grid, or press the preview key (V) to watch
 				-- the real putt roll out.
@@ -712,16 +716,14 @@ local function updateAimAndInput(dt: number)
 		}, 12)
 		if #pathPoints > 1 then
 			local landing = pathPoints[#pathPoints]
-			previewCarryStuds = (Vector3.new(landing.X, 0, landing.Z) - Vector3.new(bp.X, 0, bp.Z)).Magnitude
+			previewCarryStuds = horizontalDistance(landing, bp)
 		end
 
-		local diff = Difficulty.get()
 		if diff.preShotPath then
 			updateLivePreviewTracer(pathPoints)
 			if diff.distanceMarker and #pathPoints > 1 then
 				local landing = pathPoints[#pathPoints]
-				local carryYd = Ballistics.studsToYards(
-					(Vector3.new(landing.X, 0, landing.Z) - Vector3.new(bp.X, 0, bp.Z)).Magnitude)
+				local carryYd = Ballistics.studsToYards(horizontalDistance(landing, bp))
 				showDistanceMarker(landing, carryYd)
 			else
 				hideDistanceMarker()
@@ -924,7 +926,7 @@ capture.onCompleted = function(swing)
 
 	Hud.snapHoleStatCardInvisible()
 	ClubSounds.play(currentClub)
-	wait(0.2)
+	task.wait(0.2)
 	ShotDistance.begin(ball, if isPutt() then "putt" else "shot")
 	strokes += 1
 	hideDistanceMarker()
@@ -1125,9 +1127,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gpe: boolean)
 		applySwingProfile() -- putter swaps to 1:1 putting tempo; other clubs back to 3:1
 		if currentClub.name == "Putter" then
 			-- seed the power dial to the stroke that reaches the cup (player then adjusts for slope)
-			local flat = Vector3.new(ball.Position.X, 0, ball.Position.Z)
-			local cupFlat = Vector3.new(cupCenter.X, 0, cupCenter.Z)
-			local cupFt = (cupFlat - flat).Magnitude / STUDS_PER_FT
+			local cupFt = horizontalDistance(cupCenter, ball.Position) / STUDS_PER_FT
 			distanceFraction = math.clamp(math.sqrt(math.min(cupFt, PUTT_MAX_FT) / PUTT_MAX_FT), PUTT_MIN_POWER, 1.0)
 		end
 
